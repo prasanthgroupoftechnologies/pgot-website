@@ -1,8 +1,26 @@
+# Dependencies
 node_modules/
+
+# Production build output
+dist/
+
+# Environment variables & secrets
 .env
 .env.*
 !.env.example
-dist/
-data/
+
+# Root runtime database directory & SQLite database files (WAL / SHM)
+/data/
 *.db
+*.db-wal
+*.db-shm
 *.sqlite
+*.sqlite3
+
+# Explicitly ensure source data files are tracked
+!src/data/
+!src/data/**
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
