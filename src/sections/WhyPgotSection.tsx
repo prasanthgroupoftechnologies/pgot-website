@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 import { SectionHeading } from '../components/common/SectionHeading';
 import { principlesData } from '../data/principles';
+import { PrincipleItem } from '../types';
 
 export const WhyPgotSection: React.FC = () => {
   const getIcon = (iconName: string) => {
@@ -50,7 +51,7 @@ export const WhyPgotSection: React.FC = () => {
 
         {/* 5 Principles Grid */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 lg:gap-8 mt-12">
-          {principlesData.map((principle, index) => (
+          {principlesData.map((principle: PrincipleItem, index: number) => (
             <motion.div
               key={principle.id}
               initial={{ opacity: 0, y: 20 }}
