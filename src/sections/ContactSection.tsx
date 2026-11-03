@@ -99,8 +99,14 @@ export const ContactSection: React.FC = () => {
 
     try {
       // Resolve API endpoint: uses VITE_API_BASE_URL if configured, or relative /api/enquiry for local proxy
-      const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/+$/, '');
-      const apiUrl = `${apiBaseUrl}/api/enquiry`;
+      let apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || '').trim().replace(/\/+$/, '');
+
+      // Auto-upgrade http:// to https:// in production to prevent Render 301 redirect drops
+      if (apiBaseUrl.startsWith('http://') && window.location.protocol === 'https:') {
+        apiBaseUrl = apiBaseUrl.replace('http://', 'https://');
+      }
+
+      const apiUrl = apiBaseUrl ? `${apiBaseUrl}/api/enquiry` : '/api/enquiry';
 
       let response: Response;
       try {
@@ -118,20 +124,16 @@ export const ContactSection: React.FC = () => {
         );
       }
 
-      // Safely inspect response Content-Type before parsing to avoid "Unexpected token '<'" JSON errors
-      const contentType = response.headers.get('content-type') || '';
+      // Safely read response text first to prevent "Unexpected end of JSON input" on empty responses
+      const rawText = await response.text();
       let data: any = null;
 
-      if (contentType.includes('application/json')) {
+      if (rawText && rawText.trim().length > 0) {
         try {
-          data = await response.json();
-        } catch (jsonErr) {
-          console.error('Failed to parse response JSON:', jsonErr);
+          data = JSON.parse(rawText);
+        } catch {
+          console.warn('[ContactForm] Non-JSON response received from server:', rawText.slice(0, 150));
         }
-      } else {
-        // Read as text to avoid HTML <!DOCTYPE syntax errors
-        const textResponse = await response.text();
-        console.warn('Non-JSON response from server:', textResponse.slice(0, 150));
       }
 
       // Handle non-2xx HTTP responses gracefully
@@ -141,12 +143,15 @@ export const ContactSection: React.FC = () => {
         if (!errorMessage) {
           if (response.status === 404) {
             errorMessage =
-              'The enquiry API endpoint was not found (404). If this website is hosted on Netlify, please deploy the backend server and configure the VITE_API_BASE_URL environment variable in Netlify Site Settings.';
-          } else if (response.status === 502 || response.status === 503) {
+              'The enquiry API endpoint was not found (404). Please ensure the backend server is deployed and active.';
+          } else if (response.status === 429) {
             errorMessage =
-              'The enquiry service is temporarily unavailable (502/503). Please try again in a few moments or contact us directly.';
+              'Too many enquiry requests submitted in a short time. Please wait a few minutes before trying again.';
+          } else if (response.status === 502 || response.status === 503 || response.status === 504) {
+            errorMessage =
+              'The backend service is currently waking up or temporarily unavailable (502/504). Please try again in 30 seconds.';
           } else {
-            errorMessage = `Server responded with status ${response.status} (${response.statusText || 'Request failed'}).`;
+            errorMessage = `Service responded with status ${response.status} (${response.statusText || 'Request failed'}).`;
           }
         }
 
@@ -156,7 +161,7 @@ export const ContactSection: React.FC = () => {
       // Ensure backend explicitly confirmed success
       if (!data || data.success !== true) {
         throw new Error(
-          data?.error || 'Enquiry registration could not be verified by the backend. Please try again.'
+          data?.error || data?.message || 'Enquiry registration could not be verified by the backend. Please try again.'
         );
       }
 

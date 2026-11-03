@@ -47,12 +47,21 @@ describe('PostgreSQL Database Module Tests', () => {
     assert.ok(executedQueries[0].includes('reference_code VARCHAR(100) UNIQUE'));
   });
 
-  it('should save enquiry with parameterized values and return reference code', async () => {
+  it('should save enquiry with parameterized values in an atomic transaction and return reference code', async () => {
+    let transactionEvents = [];
     let capturedQuery = '';
     let capturedValues = [];
+    let clientReleased = false;
 
-    const mockPool = {
+    const mockClient = {
       query: async (query, values) => {
+        if (query === 'BEGIN' || query === 'COMMIT' || query === 'ROLLBACK') {
+          transactionEvents.push(query);
+          return { rows: [] };
+        }
+        if (query.includes('CREATE TABLE')) {
+          return { rows: [] };
+        }
         capturedQuery = query;
         capturedValues = values;
         return {
@@ -65,6 +74,14 @@ describe('PostgreSQL Database Module Tests', () => {
           ],
         };
       },
+      release: () => {
+        clientReleased = true;
+      },
+    };
+
+    const mockPool = {
+      connect: async () => mockClient,
+      query: async () => ({ rows: [] }),
     };
 
     setPool(mockPool);
@@ -85,6 +102,10 @@ describe('PostgreSQL Database Module Tests', () => {
     assert.strictEqual(record.id, 42);
     assert.match(record.referenceCode, /^PGOT-ENQ-\d{6}-\d{3}$/);
     assert.ok(record.createdAt);
+    assert.strictEqual(clientReleased, true);
+
+    // Verify transaction lifecycle (BEGIN -> COMMIT)
+    assert.deepStrictEqual(transactionEvents, ['BEGIN', 'COMMIT']);
 
     // Verify parameterized query security ($1..$10)
     assert.ok(capturedQuery.includes('$1, $2, $3, $4, $5, $6, $7, $8, $9, \'PENDING\', $10'));
@@ -97,6 +118,54 @@ describe('PostgreSQL Database Module Tests', () => {
     assert.strictEqual(capturedValues[6], 'Architecture Consultation');
     assert.strictEqual(capturedValues[7], 'Looking to build next-generation enterprise AI infrastructure.');
     assert.strictEqual(capturedValues[9], '192.168.1.100');
+  });
+
+  it('should rollback transaction if INSERT query fails', async () => {
+    let transactionEvents = [];
+    let clientReleased = false;
+
+    const mockClient = {
+      query: async (query) => {
+        if (query === 'BEGIN' || query === 'COMMIT' || query === 'ROLLBACK') {
+          transactionEvents.push(query);
+          return { rows: [] };
+        }
+        if (query.includes('CREATE TABLE')) {
+          return { rows: [] };
+        }
+        if (query.includes('INSERT INTO enquiries')) {
+          throw new Error('Database constraint error');
+        }
+        return { rows: [] };
+      },
+      release: () => {
+        clientReleased = true;
+      },
+    };
+
+    const mockPool = {
+      connect: async () => mockClient,
+      query: async () => ({ rows: [] }),
+    };
+
+    setPool(mockPool);
+
+    await assert.rejects(
+      async () => {
+        await saveEnquiry({
+          fullName: 'Test User',
+          companyName: 'Test Inc',
+          email: 'test@example.com',
+          phone: '9876543210',
+          message: 'Valid test message 12345',
+        });
+      },
+      /Database constraint error/
+    );
+
+    assert.ok(transactionEvents.includes('BEGIN'));
+    assert.ok(transactionEvents.includes('ROLLBACK'));
+    assert.strictEqual(clientReleased, true);
   });
 
   it('should update email status using parameterized query', async () => {

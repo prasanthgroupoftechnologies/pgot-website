@@ -3,7 +3,14 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { saveEnquiry, updateEmailStatus, getAllEnquiries, getEnquiryCount, initDb } from './database.js';
+import {
+  saveEnquiry,
+  updateEmailStatus,
+  getAllEnquiries,
+  getEnquiryCount,
+  initDb,
+  ensureDbReady,
+} from './database.js';
 import { sendEnquiryEmail } from './emailService.js';
 
 dotenv.config();
@@ -13,9 +20,23 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const HOST = process.env.HOST || '0.0.0.0';
 
-app.use(cors());
-app.use(express.json());
+// Enable trust proxy for accurate IP telemetry when hosted behind Render / Netlify reverse proxies
+app.set('trust proxy', 1);
+
+// CORS configuration (handles preflight OPTIONS, custom headers, and cross-origin fetch)
+app.use(
+  cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Accept', 'Authorization', 'X-Requested-With'],
+    optionsSuccessStatus: 200,
+  })
+);
+
+// Express JSON body parser (limit to 1MB to prevent memory exhaustion attacks)
+app.use(express.json({ limit: '1mb' }));
 
 // In-memory rate limiting map (IP -> timestamps[])
 const rateLimitMap = new Map();
@@ -24,7 +45,7 @@ function rateLimiter(req, res, next) {
   const ip = req.ip || req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
   const now = Date.now();
   const windowMs = 5 * 60 * 1000; // 5 minutes
-  const maxRequests = 15; // 15 enquiries per 5 minutes per IP
+  const maxRequests = 25; // 25 enquiries per 5 minutes per IP
 
   let timestamps = rateLimitMap.get(ip) || [];
   timestamps = timestamps.filter((time) => now - time < windowMs);
@@ -41,9 +62,29 @@ function rateLimiter(req, res, next) {
   next();
 }
 
+/**
+ * Mask customer email for secure telemetry logging without exposing PII.
+ */
+function maskEmail(email) {
+  if (!email || !email.includes('@')) return '***@***.***';
+  const [user, domain] = email.split('@');
+  const maskedUser = user.length > 2 ? `${user[0]}***${user[user.length - 1]}` : `${user[0]}***`;
+  return `${maskedUser}@${domain}`;
+}
+
+/**
+ * Mask phone number for secure telemetry logging without exposing PII.
+ */
+function maskPhone(phone) {
+  if (!phone) return '***';
+  const clean = String(phone).replace(/\s+/g, '');
+  if (clean.length < 6) return '***';
+  return `${clean.slice(0, 3)}****${clean.slice(-4)}`;
+}
+
 // Root Endpoint
 app.get('/', (req, res) => {
-  res.json({
+  res.status(200).json({
     status: 'ONLINE',
     service: 'PGOT Customer Intelligence Server',
     database: 'PostgreSQL',
@@ -51,15 +92,16 @@ app.get('/', (req, res) => {
     endpoints: {
       health: 'GET /api/health',
       enquiry: 'POST /api/enquiry',
+      enquiries: 'GET /api/enquiries',
     },
   });
 });
 
-// Health Check
+// Health Check Endpoint
 app.get('/api/health', async (req, res) => {
   const hasDbUrl = Boolean(process.env.DATABASE_URL);
   if (!hasDbUrl) {
-    return res.json({
+    return res.status(200).json({
       status: 'ONLINE',
       service: 'PGOT Customer Intelligence Server',
       timestamp: new Date().toISOString(),
@@ -78,7 +120,7 @@ app.get('/api/health', async (req, res) => {
 
   try {
     const totalStored = await getEnquiryCount();
-    res.json({
+    return res.status(200).json({
       status: 'ONLINE',
       service: 'PGOT Customer Intelligence Server',
       timestamp: new Date().toISOString(),
@@ -94,7 +136,8 @@ app.get('/api/health', async (req, res) => {
         : 'Ethereal / Fallback Test Transport',
     });
   } catch (dbErr) {
-    res.status(500).json({
+    console.error('[API HEALTH] Database connectivity error:', dbErr.message);
+    return res.status(500).json({
       status: 'DEGRADED',
       service: 'PGOT Customer Intelligence Server',
       timestamp: new Date().toISOString(),
@@ -117,22 +160,32 @@ app.get('/api/enquiries', async (req, res) => {
   try {
     const limit = parseInt(req.query.limit, 10) || 50;
     const enquiries = await getAllEnquiries(limit);
-    res.json({
+    return res.status(200).json({
       success: true,
       count: enquiries.length,
       enquiries,
     });
   } catch (error) {
-    res.status(500).json({
+    console.error('[API ENQUIRIES] Error retrieving enquiries:', error.message);
+    return res.status(500).json({
       success: false,
       error: 'Unable to retrieve enquiries: ' + error.message,
     });
   }
 });
 
-// Submit Customer Enquiry
-app.post('/api/enquiry', rateLimiter, async (req, res) => {
+// Guard against accidental GET requests on /api/enquiry
+app.get('/api/enquiry', (req, res) => {
+  return res.status(405).json({
+    success: false,
+    error: 'Method Not Allowed. Enquiry submissions must use HTTP POST.',
+  });
+});
+
+// Submit Customer Enquiry (supports both /api/enquiry and /api/enquiry/)
+async function handleEnquirySubmission(req, res) {
   try {
+    const body = req.body || {};
     const {
       fullName,
       companyName,
@@ -142,12 +195,12 @@ app.post('/api/enquiry', rateLimiter, async (req, res) => {
       subject,
       message,
       bot_trap, // Honeypot field
-    } = req.body;
+    } = body;
 
     // 1. Spam Protection: Honeypot check
-    if (bot_trap && bot_trap.trim() !== '') {
-      console.warn('Spam bot detected via honeypot. Ignoring submission silently.');
-      return res.json({
+    if (bot_trap && typeof bot_trap === 'string' && bot_trap.trim() !== '') {
+      console.warn('[SPAM BOT TRAP] Bot detected via honeypot field. Discarding silently.');
+      return res.status(200).json({
         success: true,
         referenceCode: 'PGOT-ENQ-DISCARDED',
         message: 'Enquiry received successfully.',
@@ -158,7 +211,7 @@ app.post('/api/enquiry', rateLimiter, async (req, res) => {
     if (!fullName || typeof fullName !== 'string' || fullName.trim().length < 2) {
       return res.status(400).json({
         success: false,
-        error: 'Full Name is required and must be at least 2 characters.',
+        error: 'Full Name is compulsory and must be at least 2 characters.',
       });
     }
 
@@ -178,7 +231,7 @@ app.post('/api/enquiry', rateLimiter, async (req, res) => {
     }
 
     // Clean phone validation (digits, minimum 8 digits, handles international prefix +)
-    const phoneClean = (phone || '').replace(/[^0-9+]/g, '');
+    const phoneClean = (phone || '').toString().replace(/[^0-9+]/g, '');
     if (!phone || typeof phone !== 'string' || phoneClean.replace(/\D/g, '').length < 8) {
       return res.status(400).json({
         success: false,
@@ -199,6 +252,12 @@ app.post('/api/enquiry', rateLimiter, async (req, res) => {
       req.ip ||
       'Unknown';
 
+    console.log(
+      `[API INBOUND] Processing enquiry for service "${service || 'General'}" from ${maskEmail(
+        email
+      )} (${maskPhone(phoneClean)}) [IP: ${clientIp}]`
+    );
+
     // 3. Persist into PostgreSQL Database FIRST (Zero Data Loss Guarantee)
     const enquiryRecord = await saveEnquiry({
       fullName: fullName.trim(),
@@ -211,7 +270,9 @@ app.post('/api/enquiry', rateLimiter, async (req, res) => {
       ipAddress: clientIp,
     });
 
-    console.log(`[DB] Enquiry saved to PostgreSQL with ID: ${enquiryRecord.id} (${enquiryRecord.referenceCode})`);
+    console.log(
+      `[DB SUCCESS] Enquiry persisted to PostgreSQL under Ref: ${enquiryRecord.referenceCode} (ID: ${enquiryRecord.id})`
+    );
 
     // 4. Dispatch Email to Primary & Notification Addresses
     let emailResult = { success: false, provider: 'None' };
@@ -230,17 +291,25 @@ app.post('/api/enquiry', rateLimiter, async (req, res) => {
 
       if (emailResult.success) {
         await updateEmailStatus(enquiryRecord.id, 'SENT', null);
-        console.log(`[EMAIL] Dispatch succeeded via ${emailResult.provider}:`, emailResult.messageId);
+        console.log(
+          `[EMAIL SUCCESS] Dispatch delivered via ${emailResult.provider} for Ref: ${enquiryRecord.referenceCode}`
+        );
       } else {
         await updateEmailStatus(enquiryRecord.id, 'FAILED', emailResult.error || 'Failed to dispatch');
-        console.warn(`[EMAIL] Dispatch was not delivered by provider:`, emailResult.error);
+        console.warn(
+          `[EMAIL NOTICE] Dispatch not delivered by provider for Ref: ${enquiryRecord.referenceCode}:`,
+          emailResult.error
+        );
       }
     } catch (emailErr) {
       await updateEmailStatus(enquiryRecord.id, 'FAILED', emailErr.message);
-      console.error('[EMAIL] Delivery error:', emailErr.message);
+      console.error(
+        `[EMAIL ERROR] Delivery exception for Ref: ${enquiryRecord.referenceCode}:`,
+        emailErr.message
+      );
     }
 
-    // 5. Response to Client
+    // 5. Success Response to Client (Always valid JSON)
     return res.status(200).json({
       success: true,
       referenceCode: enquiryRecord.referenceCode,
@@ -248,22 +317,64 @@ app.post('/api/enquiry', rateLimiter, async (req, res) => {
       message: 'Your enquiry has been successfully registered and transmitted to Prasanth Group of Technologies.',
       emailDelivery: emailResult,
     });
-
   } catch (err) {
-    console.error('[API] Server error during enquiry processing:', err);
+    console.error('[API ERROR] Server failure during enquiry processing:', err.message);
     return res.status(500).json({
       success: false,
-      error: 'An internal error occurred while saving your enquiry. Please try again or reach us directly at prasanthgroupoftechnologies@gmail.com.',
+      error:
+        'An error occurred while registering your enquiry. Please reach us directly at prasanthgroupoftechnologies@gmail.com.',
     });
   }
+}
+
+app.post('/api/enquiry', rateLimiter, handleEnquirySubmission);
+app.post('/api/enquiry/', rateLimiter, handleEnquirySubmission);
+
+// Global JSON 404 Handler (ensures every non-existent route returns valid JSON)
+app.use((req, res) => {
+  return res.status(404).json({
+    success: false,
+    error: `Endpoint not found: ${req.method} ${req.originalUrl}`,
+  });
+});
+
+// Global JSON Error Handler (catches malformed JSON syntax errors, payload limits, uncaught exceptions)
+app.use((err, req, res, next) => {
+  if (res.headersSent) {
+    return next(err);
+  }
+
+  // Handle JSON parse errors from express.json()
+  if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
+    console.warn('[SERVER BAD JSON] Client sent malformed JSON:', err.message);
+    return res.status(400).json({
+      success: false,
+      error: 'Malformed JSON payload. Please ensure request body is valid JSON.',
+    });
+  }
+
+  // Handle entity too large
+  if (err.type === 'entity.too.large') {
+    return res.status(413).json({
+      success: false,
+      error: 'Payload too large. Please shorten your enquiry message.',
+    });
+  }
+
+  console.error('[UNHANDLED SERVER ERROR]', err.name, err.message);
+  const statusCode = err.status || err.statusCode || 500;
+  return res.status(statusCode).json({
+    success: false,
+    error: statusCode === 500 ? 'An internal server error occurred.' : err.message,
+  });
 });
 
 export { app };
 
-// Auto-initialize PostgreSQL database schema if DATABASE_URL is configured
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+export function startServer(port = PORT, host = HOST) {
+  // Initialize schema if DATABASE_URL is configured
   if (process.env.DATABASE_URL) {
-    initDb()
+    ensureDbReady()
       .then(() => {
         console.log('[PGOT BACKEND] PostgreSQL connected and schema verified.');
       })
@@ -271,12 +382,27 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
         console.error('[PGOT BACKEND] PostgreSQL initialization error on startup:', startupErr.message);
       });
   } else {
-    console.warn('[PGOT BACKEND WARNING] DATABASE_URL is not set. Configure DATABASE_URL in Render or your environment for PostgreSQL persistence.');
+    console.warn(
+      '[PGOT BACKEND WARNING] DATABASE_URL is not set. Configure DATABASE_URL in Render or .env for PostgreSQL persistence.'
+    );
   }
 
-  // Start Server
-  app.listen(PORT, () => {
-    console.log(`[PGOT BACKEND] Server running on http://localhost:${PORT}`);
-    console.log(`[PGOT BACKEND] Database engine: PostgreSQL (${process.env.DATABASE_URL ? 'Configured' : 'Awaiting DATABASE_URL'})`);
+  return app.listen(port, host, () => {
+    console.log(`[PGOT BACKEND] Server running on http://${host}:${port}`);
+    console.log(
+      `[PGOT BACKEND] Database engine: PostgreSQL (${
+        process.env.DATABASE_URL ? 'Configured' : 'Awaiting DATABASE_URL'
+      })`
+    );
   });
+}
+
+// Start server automatically in production/development unless running under test runner
+const isRunningAsTest =
+  process.env.NODE_ENV === 'test' ||
+  process.execArgv.includes('--test') ||
+  process.argv.some((arg) => typeof arg === 'string' && (arg.includes('--test') || arg.includes('test-')));
+
+if (!isRunningAsTest) {
+  startServer();
 }

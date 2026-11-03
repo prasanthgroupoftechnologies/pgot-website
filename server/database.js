@@ -6,6 +6,7 @@ dotenv.config();
 const { Pool } = pg;
 
 let pool = null;
+let dbInitPromise = null;
 
 /**
  * Determine SSL configuration based on the PostgreSQL connection string.
@@ -63,6 +64,7 @@ export function getPool() {
  */
 export function setPool(customPool) {
   pool = customPool;
+  dbInitPromise = null;
 }
 
 /**
@@ -117,7 +119,20 @@ export async function initDb() {
 }
 
 /**
- * Save an inbound customer enquiry to PostgreSQL using parameterized queries.
+ * Ensure database schema initialization has completed or is in flight.
+ */
+export async function ensureDbReady() {
+  if (!dbInitPromise) {
+    dbInitPromise = initDb().catch((err) => {
+      dbInitPromise = null; // allow retry on next attempt
+      throw err;
+    });
+  }
+  return dbInitPromise;
+}
+
+/**
+ * Save an inbound customer enquiry to PostgreSQL using transaction & parameterized query.
  */
 export async function saveEnquiry({
   fullName,
@@ -134,10 +149,17 @@ export async function saveEnquiry({
     throw new Error('DATABASE_URL is not configured. Cannot persist enquiry to PostgreSQL.');
   }
 
+  // Ensure table and indexes exist before inserting
+  try {
+    await ensureDbReady();
+  } catch (initErr) {
+    console.warn('[DB WARNING] ensureDbReady warning, proceeding with insert attempt:', initErr.message);
+  }
+
   const createdAt = new Date().toISOString();
   const referenceCode = generateReferenceCode();
 
-  const query = `
+  const insertQuery = `
     INSERT INTO enquiries (
       reference_code,
       full_name,
@@ -167,18 +189,28 @@ export async function saveEnquiry({
     ipAddress || 'Unknown',
   ];
 
+  const client = await p.connect();
   try {
-    const result = await p.query(query, values);
-    const row = result.rows[0];
+    await client.query('BEGIN');
+    const result = await client.query(insertQuery, values);
+    await client.query('COMMIT');
 
+    const row = result.rows[0];
     return {
       id: row.id,
       referenceCode: row.reference_code,
       createdAt: row.created_at,
     };
   } catch (err) {
+    try {
+      await client.query('ROLLBACK');
+    } catch {
+      // Ignore rollback errors if connection was dropped
+    }
     console.error('[DB ERROR] Failed to save enquiry to PostgreSQL:', err.message);
     throw err;
+  } finally {
+    client.release();
   }
 }
 
@@ -255,6 +287,7 @@ export async function closePool() {
   if (pool) {
     await pool.end();
     pool = null;
+    dbInitPromise = null;
     console.log('[DB] PostgreSQL pool closed.');
   }
 }
