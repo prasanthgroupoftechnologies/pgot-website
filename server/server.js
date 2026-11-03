@@ -3,7 +3,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { saveEnquiry, updateEmailStatus, getAllEnquiries, getEnquiryCount } from './database.js';
+import { saveEnquiry, updateEmailStatus, getAllEnquiries, getEnquiryCount, getDb, dbPath } from './database.js';
 import { sendEnquiryEmail } from './emailService.js';
 
 dotenv.config();
@@ -56,17 +56,35 @@ app.get('/', (req, res) => {
 
 // Health Check
 app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'ONLINE',
-    service: 'PGOT Customer Intelligence Server',
-    timestamp: new Date().toISOString(),
-    totalStoredEnquiries: getEnquiryCount(),
-    emailProvider: process.env.RESEND_API_KEY
-      ? 'Resend API'
-      : process.env.SMTP_USER
-      ? 'SMTP / Gmail'
-      : 'Ethereal / Fallback Test Transport',
-  });
+  try {
+    const totalStored = getEnquiryCount();
+    res.json({
+      status: 'ONLINE',
+      service: 'PGOT Customer Intelligence Server',
+      timestamp: new Date().toISOString(),
+      database: {
+        status: 'CONNECTED',
+        path: dbPath,
+        totalStoredEnquiries: totalStored,
+      },
+      emailProvider: process.env.RESEND_API_KEY
+        ? 'Resend API'
+        : process.env.SMTP_USER
+        ? 'SMTP / Gmail'
+        : 'Ethereal / Fallback Test Transport',
+    });
+  } catch (dbErr) {
+    res.status(500).json({
+      status: 'DEGRADED',
+      service: 'PGOT Customer Intelligence Server',
+      timestamp: new Date().toISOString(),
+      database: {
+        status: 'ERROR',
+        error: dbErr.message,
+        path: dbPath,
+      },
+    });
+  }
 });
 
 // Enquiries List (For Testing & Verification)
@@ -215,8 +233,15 @@ app.post('/api/enquiry', rateLimiter, async (req, res) => {
   }
 });
 
+// Eagerly initialize SQLite database and ensure directory exists on startup
+try {
+  getDb();
+} catch (startupErr) {
+  console.error('[DB STARTUP WARNING] Database initialization failed on startup:', startupErr.message);
+}
+
 // Start Server
 app.listen(PORT, () => {
   console.log(`[PGOT BACKEND] Server running on http://localhost:${PORT}`);
-  console.log(`[PGOT BACKEND] Database initialized at data/enquiries.db`);
+  console.log(`[PGOT BACKEND] Database verified at: ${dbPath}`);
 });

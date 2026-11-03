@@ -1,18 +1,37 @@
-import Database from 'better-sqlite3';
+import fs from 'fs';
 import path from 'path';
+import Database from 'better-sqlite3';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const dbPath = path.resolve(__dirname, '../data/enquiries.db');
 
-let db;
+// Allow overriding database path via SQLITE_DB_PATH (e.g., Render Persistent Disk mount /var/data/enquiries.db)
+// Defaults to '<project_root>/data/enquiries.db' for local development & default deployments
+export const dbPath = process.env.SQLITE_DB_PATH
+  ? path.resolve(process.env.SQLITE_DB_PATH)
+  : path.resolve(__dirname, '../data/enquiries.db');
+
+let db = null;
 
 export function getDb() {
   if (!db) {
-    db = new Database(dbPath);
-    db.pragma('journal_mode = WAL');
-    initDb();
+    try {
+      const dbDir = path.dirname(dbPath);
+      // Ensure the parent directory exists before initializing better-sqlite3
+      if (!fs.existsSync(dbDir)) {
+        fs.mkdirSync(dbDir, { recursive: true });
+        console.log(`[DB] Created missing database directory: ${dbDir}`);
+      }
+
+      db = new Database(dbPath);
+      db.pragma('journal_mode = WAL');
+      console.log(`[DB] Successfully connected to SQLite database at: ${dbPath}`);
+      initDb();
+    } catch (err) {
+      console.error(`[DB ERROR] Failed to initialize SQLite database at ${dbPath}:`, err.message);
+      throw err;
+    }
   }
   return db;
 }
@@ -39,6 +58,7 @@ function initDb() {
     CREATE INDEX IF NOT EXISTS idx_enquiries_created_at ON enquiries(created_at);
   `;
   db.exec(schema);
+  console.log(`[DB] Schema verified and indexes initialized.`);
 }
 
 export function saveEnquiry({
