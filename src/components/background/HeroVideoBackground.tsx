@@ -1,5 +1,4 @@
 import React, { useRef, useState, useEffect } from 'react';
-import { Play, Pause, Volume2, VolumeX } from 'lucide-react';
 
 interface HeroVideoBackgroundProps {
   videoSrc?: string;
@@ -14,64 +13,54 @@ export const HeroVideoBackground: React.FC<HeroVideoBackgroundProps> = ({
 }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [isVideoLoaded, setIsVideoLoaded] = useState(false);
-  const [isPlaying, setIsPlaying] = useState(true);
-  const [isMuted, setIsMuted] = useState(true);
   const [hasError, setHasError] = useState(false);
 
   useEffect(() => {
     const video = videoRef.current;
     if (!video) return;
 
-    // Check prefers-reduced-motion
-    const mediaQuery = window.matchMedia('(prefers-reduced-motion: reduce)');
-    if (mediaQuery.matches) {
-      video.pause();
-      setIsPlaying(false);
-      return;
-    }
+    // Enforce muted on property level for strict mobile & desktop autoplay compliance (iOS Safari, Chrome, Edge)
+    video.muted = true;
+    video.defaultMuted = true;
 
-    const handleLoadedData = () => {
-      setIsVideoLoaded(true);
+    const attemptPlay = () => {
       const playPromise = video.play();
       if (playPromise !== undefined) {
-        playPromise
-          .then(() => setIsPlaying(true))
-          .catch((err) => {
-            console.warn('Autoplay prevented or interrupted:', err);
-            setIsPlaying(false);
-          });
+        playPromise.catch((err) => {
+          // Autoplay was prevented or interrupted (e.g. low power mode)
+          console.warn('Hero background video autoplay notice:', err);
+        });
       }
     };
 
+    const handleLoadedData = () => {
+      setIsVideoLoaded(true);
+      attemptPlay();
+    };
+
     const handleError = () => {
-      console.warn('Hero background video encountered a playback error; using procedural visual fallback.');
+      console.warn('Hero background video encountered playback error; falling back to visual ambient styling.');
       setHasError(true);
     };
 
+    // If video is already ready (from cache or fast load)
+    if (video.readyState >= 2) {
+      setIsVideoLoaded(true);
+      attemptPlay();
+    }
+
     video.addEventListener('loadeddata', handleLoadedData);
+    video.addEventListener('canplay', attemptPlay);
     video.addEventListener('error', handleError);
+
+    attemptPlay();
 
     return () => {
       video.removeEventListener('loadeddata', handleLoadedData);
+      video.removeEventListener('canplay', attemptPlay);
       video.removeEventListener('error', handleError);
     };
-  }, []);
-
-  const togglePlay = () => {
-    if (!videoRef.current) return;
-    if (isPlaying) {
-      videoRef.current.pause();
-      setIsPlaying(false);
-    } else {
-      videoRef.current.play().then(() => setIsPlaying(true)).catch(console.error);
-    }
-  };
-
-  const toggleMute = () => {
-    if (!videoRef.current) return;
-    videoRef.current.muted = !isMuted;
-    setIsMuted(!isMuted);
-  };
+  }, [videoSrc]);
 
   return (
     <div
@@ -81,7 +70,7 @@ export const HeroVideoBackground: React.FC<HeroVideoBackgroundProps> = ({
       {/* 1. Underlying Base Background Color */}
       <div className="absolute inset-0 bg-[#061426]" />
 
-      {/* 2. Background Video */}
+      {/* 2. Continuous Autoplay Looping Background Video (Always Muted, Object-Fit Cover) */}
       {!hasError && (
         <video
           ref={videoRef}
@@ -95,10 +84,11 @@ export const HeroVideoBackground: React.FC<HeroVideoBackgroundProps> = ({
           className={`absolute inset-0 w-full h-full object-cover transition-opacity duration-1000 ${
             isVideoLoaded ? 'opacity-90' : 'opacity-0'
           }`}
+          style={{ objectFit: 'cover' }}
         />
       )}
 
-      {/* Fallback Static Visual if video fails or reduced motion is active */}
+      {/* Fallback Static Visual if video fails or is loading */}
       {(hasError || !isVideoLoaded) && (
         <div className="absolute inset-0 flex items-center justify-end pr-12 lg:pr-32 opacity-25">
           <div className="w-[500px] h-[500px] rounded-full border border-[#D4AF37]/30 bg-radial from-[#168BFF]/20 via-[#0A1B33]/60 to-transparent animate-pulse-slow flex items-center justify-center">
@@ -155,30 +145,6 @@ export const HeroVideoBackground: React.FC<HeroVideoBackgroundProps> = ({
           backgroundSize: '80px 80px',
         }}
       />
-
-      {/* Video Control Pill (accessible, bottom-right) */}
-      <div className="absolute bottom-6 right-6 z-20 pointer-events-auto flex items-center gap-2 bg-[#061426]/75 backdrop-blur-md border border-[#D4AF37]/30 px-3 py-1.5 rounded-full text-xs text-gray-300">
-        <button
-          onClick={togglePlay}
-          className="flex items-center gap-1.5 hover:text-[#D4AF37] transition-colors focus:outline-none"
-          title={isPlaying ? 'Pause Background Video' : 'Play Background Video'}
-          aria-label={isPlaying ? 'Pause Background Video' : 'Play Background Video'}
-        >
-          {isPlaying ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
-          <span className="text-[11px] font-medium hidden sm:inline">
-            {isPlaying ? 'Live Cinematic' : 'Paused'}
-          </span>
-        </button>
-        <span className="h-3 w-[1px] bg-white/20" />
-        <button
-          onClick={toggleMute}
-          className="hover:text-[#D4AF37] transition-colors focus:outline-none"
-          title={isMuted ? 'Unmute Audio' : 'Mute Audio'}
-          aria-label={isMuted ? 'Unmute Audio' : 'Mute Audio'}
-        >
-          {isMuted ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
-        </button>
-      </div>
     </div>
   );
 };
