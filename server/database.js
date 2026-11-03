@@ -1,67 +1,125 @@
-import fs from 'fs';
-import path from 'path';
-import Database from 'better-sqlite3';
-import { fileURLToPath } from 'url';
+import pg from 'pg';
+import dotenv from 'dotenv';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+dotenv.config();
 
-// Allow overriding database path via SQLITE_DB_PATH (e.g., Render Persistent Disk mount /var/data/enquiries.db)
-// Defaults to '<project_root>/data/enquiries.db' for local development & default deployments
-export const dbPath = process.env.SQLITE_DB_PATH
-  ? path.resolve(process.env.SQLITE_DB_PATH)
-  : path.resolve(__dirname, '../data/enquiries.db');
+const { Pool } = pg;
 
-let db = null;
+let pool = null;
 
-export function getDb() {
-  if (!db) {
+/**
+ * Determine SSL configuration based on the PostgreSQL connection string.
+ * Local connections (localhost/127.0.0.1) or explicit DATABASE_SSL=false use no SSL.
+ * Remote managed databases (Render, Neon, Supabase, AWS RDS, etc.) require SSL with rejectUnauthorized: false.
+ */
+function getSslConfig(connectionString) {
+  if (!connectionString) return false;
+  if (process.env.DATABASE_SSL === 'false') return false;
+  if (
+    connectionString.includes('localhost') ||
+    connectionString.includes('127.0.0.1')
+  ) {
+    return false;
+  }
+  return { rejectUnauthorized: false };
+}
+
+/**
+ * Get or initialize the PostgreSQL connection pool.
+ */
+export function getPool() {
+  if (!pool) {
+    const connectionString = process.env.DATABASE_URL;
+    if (!connectionString) {
+      console.warn('[DB WARNING] DATABASE_URL is not defined. PostgreSQL queries will not execute until DATABASE_URL is configured.');
+      return null;
+    }
+
     try {
-      const dbDir = path.dirname(dbPath);
-      // Ensure the parent directory exists before initializing better-sqlite3
-      if (!fs.existsSync(dbDir)) {
-        fs.mkdirSync(dbDir, { recursive: true });
-        console.log(`[DB] Created missing database directory: ${dbDir}`);
-      }
+      const sslConfig = getSslConfig(connectionString);
+      pool = new Pool({
+        connectionString,
+        ssl: sslConfig,
+        max: parseInt(process.env.DB_POOL_MAX || '10', 10),
+        idleTimeoutMillis: 30000,
+        connectionTimeoutMillis: 10000,
+      });
 
-      db = new Database(dbPath);
-      db.pragma('journal_mode = WAL');
-      console.log(`[DB] Successfully connected to SQLite database at: ${dbPath}`);
-      initDb();
+      pool.on('error', (err) => {
+        console.error('[DB POOL ERROR] Unexpected idle PostgreSQL client error:', err.message);
+      });
+
+      console.log(`[DB] PostgreSQL connection pool initialized (SSL: ${sslConfig ? 'enabled' : 'disabled'}).`);
     } catch (err) {
-      console.error(`[DB ERROR] Failed to initialize SQLite database at ${dbPath}:`, err.message);
+      console.error('[DB ERROR] Failed to create PostgreSQL pool:', err.message);
       throw err;
     }
   }
-  return db;
+  return pool;
 }
 
-function initDb() {
-  const schema = `
-    CREATE TABLE IF NOT EXISTS enquiries (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      reference_code TEXT UNIQUE,
-      full_name TEXT NOT NULL,
-      company_name TEXT NOT NULL,
-      email TEXT NOT NULL,
-      phone TEXT NOT NULL,
-      service TEXT,
-      subject TEXT,
-      message TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      email_status TEXT DEFAULT 'PENDING',
-      email_error TEXT,
-      ip_address TEXT
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_enquiries_email ON enquiries(email);
-    CREATE INDEX IF NOT EXISTS idx_enquiries_created_at ON enquiries(created_at);
-  `;
-  db.exec(schema);
-  console.log(`[DB] Schema verified and indexes initialized.`);
+/**
+ * Allow injection of a mock or custom pool (useful for testing).
+ */
+export function setPool(customPool) {
+  pool = customPool;
 }
 
-export function saveEnquiry({
+/**
+ * Generate standard PGOT customer enquiry reference code (e.g. PGOT-ENQ-123456-789).
+ */
+export function generateReferenceCode() {
+  const timestampNum = Date.now().toString().slice(-6);
+  const randomSuffix = Math.floor(100 + Math.random() * 900);
+  return `PGOT-ENQ-${timestampNum}-${randomSuffix}`;
+}
+
+/**
+ * Initialize the PostgreSQL schema and create table and indexes if they do not exist.
+ */
+export async function initDb() {
+  const p = getPool();
+  if (!p) {
+    throw new Error('DATABASE_URL is not configured. Cannot initialize PostgreSQL schema.');
+  }
+
+  const client = await p.connect();
+  try {
+    const schema = `
+      CREATE TABLE IF NOT EXISTS enquiries (
+        id SERIAL PRIMARY KEY,
+        reference_code VARCHAR(100) UNIQUE,
+        full_name VARCHAR(255) NOT NULL,
+        company_name VARCHAR(255) NOT NULL,
+        email VARCHAR(255) NOT NULL,
+        phone VARCHAR(50) NOT NULL,
+        service VARCHAR(255),
+        subject VARCHAR(255),
+        message TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL,
+        email_status VARCHAR(50) DEFAULT 'PENDING',
+        email_error TEXT,
+        ip_address VARCHAR(100)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_enquiries_email ON enquiries(email);
+      CREATE INDEX IF NOT EXISTS idx_enquiries_created_at ON enquiries(created_at);
+    `;
+
+    await client.query(schema);
+    console.log('[DB] PostgreSQL schema verified and indexes initialized successfully.');
+  } catch (err) {
+    console.error('[DB ERROR] Failed to initialize PostgreSQL schema:', err.message);
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Save an inbound customer enquiry to PostgreSQL using parameterized queries.
+ */
+export async function saveEnquiry({
   fullName,
   companyName,
   email,
@@ -71,13 +129,15 @@ export function saveEnquiry({
   message,
   ipAddress,
 }) {
-  const database = getDb();
-  const createdAt = new Date().toISOString();
-  const timestampNum = Date.now().toString().slice(-6);
-  const randomSuffix = Math.floor(100 + Math.random() * 900);
-  const referenceCode = `PGOT-ENQ-${timestampNum}-${randomSuffix}`;
+  const p = getPool();
+  if (!p) {
+    throw new Error('DATABASE_URL is not configured. Cannot persist enquiry to PostgreSQL.');
+  }
 
-  const stmt = database.prepare(`
+  const createdAt = new Date().toISOString();
+  const referenceCode = generateReferenceCode();
+
+  const query = `
     INSERT INTO enquiries (
       reference_code,
       full_name,
@@ -90,63 +150,111 @@ export function saveEnquiry({
       created_at,
       email_status,
       ip_address
-    ) VALUES (
-      @referenceCode,
-      @fullName,
-      @companyName,
-      @email,
-      @phone,
-      @service,
-      @subject,
-      @message,
-      @createdAt,
-      'PENDING',
-      @ipAddress
-    )
-  `);
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'PENDING', $10)
+    RETURNING id, reference_code, created_at;
+  `;
 
-  const result = stmt.run({
+  const values = [
     referenceCode,
     fullName,
     companyName,
     email,
     phone,
-    service: service || 'General Technical Consultation',
-    subject: subject || 'New Customer Enquiry',
+    service || 'General Technical Consultation',
+    subject || 'New Customer Enquiry',
     message,
     createdAt,
-    ipAddress: ipAddress || 'Unknown',
-  });
+    ipAddress || 'Unknown',
+  ];
 
-  return {
-    id: result.lastInsertRowid,
-    referenceCode,
-    createdAt,
-  };
+  try {
+    const result = await p.query(query, values);
+    const row = result.rows[0];
+
+    return {
+      id: row.id,
+      referenceCode: row.reference_code,
+      createdAt: row.created_at,
+    };
+  } catch (err) {
+    console.error('[DB ERROR] Failed to save enquiry to PostgreSQL:', err.message);
+    throw err;
+  }
 }
 
-export function updateEmailStatus(id, status, errorMsg = null) {
-  const database = getDb();
-  const stmt = database.prepare(`
+/**
+ * Update the dispatch status and optional error message for an enquiry record.
+ */
+export async function updateEmailStatus(id, status, errorMsg = null) {
+  const p = getPool();
+  if (!p) {
+    console.warn('[DB WARNING] Cannot update email status: DATABASE_URL not configured.');
+    return;
+  }
+
+  const query = `
     UPDATE enquiries
-    SET email_status = ?, email_error = ?
-    WHERE id = ?
-  `);
-  stmt.run(status, errorMsg, id);
+    SET email_status = $1, email_error = $2
+    WHERE id = $3;
+  `;
+
+  try {
+    await p.query(query, [status, errorMsg, id]);
+  } catch (err) {
+    console.error(`[DB ERROR] Failed to update email status for enquiry ID ${id}:`, err.message);
+  }
 }
 
-export function getAllEnquiries(limit = 100) {
-  const database = getDb();
-  const stmt = database.prepare(`
+/**
+ * Fetch latest customer enquiries for verification & reporting.
+ */
+export async function getAllEnquiries(limit = 100) {
+  const p = getPool();
+  if (!p) {
+    throw new Error('DATABASE_URL is not configured.');
+  }
+
+  const query = `
     SELECT * FROM enquiries
     ORDER BY id DESC
-    LIMIT ?
-  `);
-  return stmt.all(limit);
+    LIMIT $1;
+  `;
+
+  try {
+    const result = await p.query(query, [limit]);
+    return result.rows;
+  } catch (err) {
+    console.error('[DB ERROR] Failed to fetch enquiries from PostgreSQL:', err.message);
+    throw err;
+  }
 }
 
-export function getEnquiryCount() {
-  const database = getDb();
-  const row = database.prepare('SELECT COUNT(*) as count FROM enquiries').get();
-  return row ? row.count : 0;
+/**
+ * Retrieve total count of enquiries currently stored in PostgreSQL.
+ */
+export async function getEnquiryCount() {
+  const p = getPool();
+  if (!p) {
+    throw new Error('DATABASE_URL is not configured.');
+  }
+
+  const query = 'SELECT COUNT(*) as count FROM enquiries;';
+  try {
+    const result = await p.query(query);
+    return parseInt(result.rows[0]?.count || 0, 10);
+  } catch (err) {
+    console.error('[DB ERROR] Failed to get enquiry count from PostgreSQL:', err.message);
+    throw err;
+  }
+}
+
+/**
+ * Gracefully close the PostgreSQL connection pool.
+ */
+export async function closePool() {
+  if (pool) {
+    await pool.end();
+    pool = null;
+    console.log('[DB] PostgreSQL pool closed.');
+  }
 }

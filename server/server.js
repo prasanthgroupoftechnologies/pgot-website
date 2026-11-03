@@ -3,7 +3,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { saveEnquiry, updateEmailStatus, getAllEnquiries, getEnquiryCount, getDb, dbPath } from './database.js';
+import { saveEnquiry, updateEmailStatus, getAllEnquiries, getEnquiryCount, initDb } from './database.js';
 import { sendEnquiryEmail } from './emailService.js';
 
 dotenv.config();
@@ -46,6 +46,7 @@ app.get('/', (req, res) => {
   res.json({
     status: 'ONLINE',
     service: 'PGOT Customer Intelligence Server',
+    database: 'PostgreSQL',
     version: '1.0.0',
     endpoints: {
       health: 'GET /api/health',
@@ -55,16 +56,35 @@ app.get('/', (req, res) => {
 });
 
 // Health Check
-app.get('/api/health', (req, res) => {
+app.get('/api/health', async (req, res) => {
+  const hasDbUrl = Boolean(process.env.DATABASE_URL);
+  if (!hasDbUrl) {
+    return res.json({
+      status: 'ONLINE',
+      service: 'PGOT Customer Intelligence Server',
+      timestamp: new Date().toISOString(),
+      database: {
+        type: 'PostgreSQL',
+        status: 'CONFIGURATION_REQUIRED',
+        message: 'DATABASE_URL environment variable is not defined.',
+      },
+      emailProvider: process.env.RESEND_API_KEY
+        ? 'Resend API'
+        : process.env.SMTP_USER
+        ? 'SMTP / Gmail'
+        : 'Ethereal / Fallback Test Transport',
+    });
+  }
+
   try {
-    const totalStored = getEnquiryCount();
+    const totalStored = await getEnquiryCount();
     res.json({
       status: 'ONLINE',
       service: 'PGOT Customer Intelligence Server',
       timestamp: new Date().toISOString(),
       database: {
+        type: 'PostgreSQL',
         status: 'CONNECTED',
-        path: dbPath,
         totalStoredEnquiries: totalStored,
       },
       emailProvider: process.env.RESEND_API_KEY
@@ -79,19 +99,24 @@ app.get('/api/health', (req, res) => {
       service: 'PGOT Customer Intelligence Server',
       timestamp: new Date().toISOString(),
       database: {
+        type: 'PostgreSQL',
         status: 'ERROR',
         error: dbErr.message,
-        path: dbPath,
       },
+      emailProvider: process.env.RESEND_API_KEY
+        ? 'Resend API'
+        : process.env.SMTP_USER
+        ? 'SMTP / Gmail'
+        : 'Ethereal / Fallback Test Transport',
     });
   }
 });
 
 // Enquiries List (For Testing & Verification)
-app.get('/api/enquiries', (req, res) => {
+app.get('/api/enquiries', async (req, res) => {
   try {
     const limit = parseInt(req.query.limit, 10) || 50;
-    const enquiries = getAllEnquiries(limit);
+    const enquiries = await getAllEnquiries(limit);
     res.json({
       success: true,
       count: enquiries.length,
@@ -174,8 +199,8 @@ app.post('/api/enquiry', rateLimiter, async (req, res) => {
       req.ip ||
       'Unknown';
 
-    // 3. Persist into Database FIRST (Zero Data Loss Guarantee)
-    const enquiryRecord = saveEnquiry({
+    // 3. Persist into PostgreSQL Database FIRST (Zero Data Loss Guarantee)
+    const enquiryRecord = await saveEnquiry({
       fullName: fullName.trim(),
       companyName: companyName.trim(),
       email: email.trim().toLowerCase(),
@@ -186,7 +211,7 @@ app.post('/api/enquiry', rateLimiter, async (req, res) => {
       ipAddress: clientIp,
     });
 
-    console.log(`[DB] Enquiry saved successfully with ID: ${enquiryRecord.id} (${enquiryRecord.referenceCode})`);
+    console.log(`[DB] Enquiry saved to PostgreSQL with ID: ${enquiryRecord.id} (${enquiryRecord.referenceCode})`);
 
     // 4. Dispatch Email to Primary & Notification Addresses
     let emailResult = { success: false, provider: 'None' };
@@ -204,14 +229,14 @@ app.post('/api/enquiry', rateLimiter, async (req, res) => {
       });
 
       if (emailResult.success) {
-        updateEmailStatus(enquiryRecord.id, 'SENT', null);
+        await updateEmailStatus(enquiryRecord.id, 'SENT', null);
         console.log(`[EMAIL] Dispatch succeeded via ${emailResult.provider}:`, emailResult.messageId);
       } else {
-        updateEmailStatus(enquiryRecord.id, 'FAILED', emailResult.error || 'Failed to dispatch');
+        await updateEmailStatus(enquiryRecord.id, 'FAILED', emailResult.error || 'Failed to dispatch');
         console.warn(`[EMAIL] Dispatch was not delivered by provider:`, emailResult.error);
       }
     } catch (emailErr) {
-      updateEmailStatus(enquiryRecord.id, 'FAILED', emailErr.message);
+      await updateEmailStatus(enquiryRecord.id, 'FAILED', emailErr.message);
       console.error('[EMAIL] Delivery error:', emailErr.message);
     }
 
@@ -233,15 +258,25 @@ app.post('/api/enquiry', rateLimiter, async (req, res) => {
   }
 });
 
-// Eagerly initialize SQLite database and ensure directory exists on startup
-try {
-  getDb();
-} catch (startupErr) {
-  console.error('[DB STARTUP WARNING] Database initialization failed on startup:', startupErr.message);
-}
+export { app };
 
-// Start Server
-app.listen(PORT, () => {
-  console.log(`[PGOT BACKEND] Server running on http://localhost:${PORT}`);
-  console.log(`[PGOT BACKEND] Database verified at: ${dbPath}`);
-});
+// Auto-initialize PostgreSQL database schema if DATABASE_URL is configured
+if (process.argv[1] === fileURLToPath(import.meta.url)) {
+  if (process.env.DATABASE_URL) {
+    initDb()
+      .then(() => {
+        console.log('[PGOT BACKEND] PostgreSQL connected and schema verified.');
+      })
+      .catch((startupErr) => {
+        console.error('[PGOT BACKEND] PostgreSQL initialization error on startup:', startupErr.message);
+      });
+  } else {
+    console.warn('[PGOT BACKEND WARNING] DATABASE_URL is not set. Configure DATABASE_URL in Render or your environment for PostgreSQL persistence.');
+  }
+
+  // Start Server
+  app.listen(PORT, () => {
+    console.log(`[PGOT BACKEND] Server running on http://localhost:${PORT}`);
+    console.log(`[PGOT BACKEND] Database engine: PostgreSQL (${process.env.DATABASE_URL ? 'Configured' : 'Awaiting DATABASE_URL'})`);
+  });
+}

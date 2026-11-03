@@ -29,18 +29,42 @@ A complete, premium, futuristic, cinematic corporate web platform engineered for
 - **Message** (compulsory, min 10 chars)
 - **Honeypot Trap** (invisible anti-spam field)
 
-### 2. Zero-Data-Loss Database Persistence
-Every submitted enquiry is stored in a local SQLite database at `data/enquiries.db`:
+### 2. Zero-Data-Loss PostgreSQL Persistence
+Every submitted enquiry is stored in a production-ready PostgreSQL database via connection pooling (`pg` Pool):
 - Unique Reference Code (e.g. `PGOT-ENQ-894095-582`)
 - Customer Name, Company, Email, Phone, Service, Subject, Message
-- Submission Timestamp (ISO format)
+- Submission Timestamp with Timezone (`TIMESTAMPTZ`)
 - Email Delivery Status (`SENT` / `FAILED` / `PENDING`)
 - Client IP Address
+- Automatic Schema & Indexes (`idx_enquiries_email`, `idx_enquiries_created_at`) created automatically on startup.
 
 ### 3. Automated Dual-Inbox Notifications
 Every enquiry triggers an HTML email with the customer's full specifications and sets `Reply-To` directly to the customer's email address:
 - **Primary Recipient**: `prasanthgroupoftechnologies@gmail.com`
 - **Notification Recipient**: `prasanthhealthtech@gmail.com`
+
+---
+
+## 🐘 Database Configuration (PostgreSQL)
+
+The PGOT backend utilizes the standard `pg` driver with connection pooling. It connects to PostgreSQL using the `DATABASE_URL` environment variable.
+
+### Setting Up PostgreSQL on Render (Recommended)
+1. Go to your [Render Dashboard](https://dashboard.render.com).
+2. Click **New +** and select **PostgreSQL**.
+3. Set a name (e.g., `pgot-database`) and choose the free tier or preferred tier.
+4. Once provisioned, copy the **Internal Database URL** (if your backend service is also hosted on Render) or **External Database URL**.
+5. In your Backend Web Service settings on Render, navigate to **Environment** and add:
+   ```env
+   DATABASE_URL=postgresql://user:password@hostname/database_name
+   ```
+6. Deploy the backend! On startup, the backend automatically connects, creates the `enquiries` table, and provisions index structures without manual SQL migration.
+
+### Local PostgreSQL Development
+Add `DATABASE_URL` to your `.env` file:
+```env
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pgot_db
+```
 
 ---
 
