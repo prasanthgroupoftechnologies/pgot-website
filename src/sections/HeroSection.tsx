@@ -1,8 +1,7 @@
 import React from 'react';
 import { motion } from 'framer-motion';
-import { ArrowRight, ShieldCheck, Cpu, Globe2, Sparkles, ChevronDown } from 'lucide-react';
+import { ArrowRight, ShieldCheck, Cpu, Globe2, ChevronDown } from 'lucide-react';
 import { HeroVideoBackground } from '../components/background/HeroVideoBackground';
-import { ParticleFieldCanvas } from '../components/background/ParticleFieldCanvas';
 import { InteractiveGlobe } from '../components/3d/InteractiveGlobe';
 import { GlowBadge } from '../components/common/GlowBadge';
 import { Button } from '../components/common/Button';
@@ -24,10 +23,7 @@ export const HeroSection: React.FC = () => {
         posterSrc="/assets/images/pgot-logo.png"
       />
 
-      {/* 2. Interactive Ambient Particle System */}
-      <ParticleFieldCanvas particleCount={40} className="z-10" />
-
-      {/* 3. Main Hero Content Grid */}
+      {/* 2. Main Hero Content Grid */}
       <div className="relative z-20 max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 w-full my-auto py-12">
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-12 lg:gap-8 items-center">
           
@@ -95,7 +91,6 @@ export const HeroSection: React.FC = () => {
               <Button
                 variant="secondary"
                 size="lg"
-                icon={<Sparkles className="w-4 h-4 text-[#D4AF37]" />}
                 onClick={() => scrollTo('about')}
                 className="w-full sm:w-auto"
               >
@@ -173,7 +168,7 @@ export const HeroSection: React.FC = () => {
         </div>
       </div>
 
-      {/* 4. Bottom Scroll Indicator */}
+      {/* 3. Bottom Scroll Indicator */}
       <div className="relative z-20 flex justify-center mt-4">
         <button
           onClick={() => scrollTo('about')}
