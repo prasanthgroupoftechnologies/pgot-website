@@ -41,6 +41,19 @@ function rateLimiter(req, res, next) {
   next();
 }
 
+// Root Endpoint
+app.get('/', (req, res) => {
+  res.json({
+    status: 'ONLINE',
+    service: 'PGOT Customer Intelligence Server',
+    version: '1.0.0',
+    endpoints: {
+      health: 'GET /api/health',
+      enquiry: 'POST /api/enquiry',
+    },
+  });
+});
+
 // Health Check
 app.get('/api/health', (req, res) => {
   res.json({

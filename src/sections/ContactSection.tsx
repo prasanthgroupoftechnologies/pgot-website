@@ -98,21 +98,69 @@ export const ContactSection: React.FC = () => {
     setIsSubmitting(true);
 
     try {
-      const response = await fetch('/api/enquiry', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(formData),
-      });
+      // Resolve API endpoint: uses VITE_API_BASE_URL if configured, or relative /api/enquiry for local proxy
+      const apiBaseUrl = (import.meta.env.VITE_API_BASE_URL || '').replace(/\/+$/, '');
+      const apiUrl = `${apiBaseUrl}/api/enquiry`;
 
-      const data = await response.json();
-
-      if (!response.ok || !data.success) {
-        throw new Error(data.error || 'Failed to register your enquiry. Please verify details and try again.');
+      let response: Response;
+      try {
+        response = await fetch(apiUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Accept: 'application/json',
+          },
+          body: JSON.stringify(formData),
+        });
+      } catch (networkErr: any) {
+        throw new Error(
+          'Unable to connect to the enquiry service. Please check your network connection or contact us directly at prasanthgroupoftechnologies@gmail.com.'
+        );
       }
 
-      // Success
+      // Safely inspect response Content-Type before parsing to avoid "Unexpected token '<'" JSON errors
+      const contentType = response.headers.get('content-type') || '';
+      let data: any = null;
+
+      if (contentType.includes('application/json')) {
+        try {
+          data = await response.json();
+        } catch (jsonErr) {
+          console.error('Failed to parse response JSON:', jsonErr);
+        }
+      } else {
+        // Read as text to avoid HTML <!DOCTYPE syntax errors
+        const textResponse = await response.text();
+        console.warn('Non-JSON response from server:', textResponse.slice(0, 150));
+      }
+
+      // Handle non-2xx HTTP responses gracefully
+      if (!response.ok) {
+        let errorMessage = data?.error || data?.message;
+
+        if (!errorMessage) {
+          if (response.status === 404) {
+            errorMessage =
+              'The enquiry API endpoint was not found (404). If this website is hosted on Netlify, please deploy the backend server and configure the VITE_API_BASE_URL environment variable in Netlify Site Settings.';
+          } else if (response.status === 502 || response.status === 503) {
+            errorMessage =
+              'The enquiry service is temporarily unavailable (502/503). Please try again in a few moments or contact us directly.';
+          } else {
+            errorMessage = `Server responded with status ${response.status} (${response.statusText || 'Request failed'}).`;
+          }
+        }
+
+        throw new Error(errorMessage);
+      }
+
+      // Ensure backend explicitly confirmed success
+      if (!data || data.success !== true) {
+        throw new Error(
+          data?.error || 'Enquiry registration could not be verified by the backend. Please try again.'
+        );
+      }
+
+      // Success confirmed by backend
       setIsSubmitted(true);
       setSubmittedReference(data.referenceCode || 'PGOT-ENQ-CONFIRMED');
       setFormData({
@@ -129,7 +177,7 @@ export const ContactSection: React.FC = () => {
     } catch (err: any) {
       console.error('Submission failed:', err);
       setServerError(
-        err.message || 'Unable to connect to the enquiry service. Please try again or email us directly.'
+        err.message || 'Unable to register your enquiry. Please reach us directly via email or telephone below.'
       );
     } finally {
       setIsSubmitting(false);
