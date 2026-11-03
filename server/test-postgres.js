@@ -16,7 +16,7 @@ describe('PostgreSQL Database Module Tests', () => {
     assert.match(code, /^PGOT-ENQ-\d{6}-\d{3}$/);
   });
 
-  it('should execute CREATE TABLE and INDEX queries in initDb()', async () => {
+  it('should execute CREATE TABLE, ALTER TABLE and INDEX queries in initDb()', async () => {
     let executedQueries = [];
     let released = false;
 
@@ -42,12 +42,13 @@ describe('PostgreSQL Database Module Tests', () => {
     assert.strictEqual(executedQueries.length, 1);
     assert.strictEqual(released, true);
     assert.ok(executedQueries[0].includes('CREATE TABLE IF NOT EXISTS enquiries'));
+    assert.ok(executedQueries[0].includes('ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS'));
     assert.ok(executedQueries[0].includes('idx_enquiries_email'));
     assert.ok(executedQueries[0].includes('idx_enquiries_created_at'));
-    assert.ok(executedQueries[0].includes('reference_code VARCHAR(100) UNIQUE'));
+    assert.ok(executedQueries[0].includes('idx_enquiries_reference_code'));
   });
 
-  it('should save enquiry with parameterized values in an atomic transaction and return reference code', async () => {
+  it('should save enquiry with sanitized parameterized values in an atomic transaction and return reference code', async () => {
     let transactionEvents = [];
     let capturedQuery = '';
     let capturedValues = [];
@@ -59,7 +60,7 @@ describe('PostgreSQL Database Module Tests', () => {
           transactionEvents.push(query);
           return { rows: [] };
         }
-        if (query.includes('CREATE TABLE')) {
+        if (query.includes('CREATE TABLE') || query.includes('ALTER TABLE')) {
           return { rows: [] };
         }
         capturedQuery = query;
@@ -94,7 +95,7 @@ describe('PostgreSQL Database Module Tests', () => {
       service: 'AI & Enterprise Software',
       subject: 'Architecture Consultation',
       message: 'Looking to build next-generation enterprise AI infrastructure.',
-      ipAddress: '192.168.1.100',
+      ipAddress: '192.168.1.100, 10.0.0.1, 172.16.0.1',
     };
 
     const record = await saveEnquiry(enquiryInput);
@@ -117,7 +118,7 @@ describe('PostgreSQL Database Module Tests', () => {
     assert.strictEqual(capturedValues[5], 'AI & Enterprise Software');
     assert.strictEqual(capturedValues[6], 'Architecture Consultation');
     assert.strictEqual(capturedValues[7], 'Looking to build next-generation enterprise AI infrastructure.');
-    assert.strictEqual(capturedValues[9], '192.168.1.100');
+    assert.strictEqual(capturedValues[9], '192.168.1.100, 10.0.0.1, 172.16.0.1');
   });
 
   it('should rollback transaction if INSERT query fails', async () => {
@@ -130,11 +131,13 @@ describe('PostgreSQL Database Module Tests', () => {
           transactionEvents.push(query);
           return { rows: [] };
         }
-        if (query.includes('CREATE TABLE')) {
+        if (query.includes('CREATE TABLE') || query.includes('ALTER TABLE')) {
           return { rows: [] };
         }
         if (query.includes('INSERT INTO enquiries')) {
-          throw new Error('Database constraint error');
+          const err = new Error('Database constraint error');
+          err.code = '23505';
+          throw err;
         }
         return { rows: [] };
       },

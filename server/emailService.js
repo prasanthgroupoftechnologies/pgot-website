@@ -120,6 +120,10 @@ function createHtmlTemplate({
   `;
 }
 
+/**
+ * Dispatch enquiry notification email using configured provider.
+ * Guaranteed to catch all internal errors and NEVER throw.
+ */
 export async function sendEnquiryEmail(enquiryData) {
   const { referenceCode, fullName, email, subject } = enquiryData;
   const emailSubject = `[PGOT ENQUIRY] ${subject || 'New Business Inquiry'} - ${fullName} (${referenceCode})`;
@@ -144,12 +148,13 @@ Recipients: ${PRIMARY_EMAIL}, ${NOTIFICATION_EMAIL}
   `;
 
   // 1. Try Resend if configured
-  if (process.env.RESEND_API_KEY) {
+  const resendKey = (process.env.RESEND_API_KEY || '').trim();
+  if (resendKey) {
     try {
-      const resend = new Resend(process.env.RESEND_API_KEY);
-      const fromAddress = process.env.EMAIL_FROM || 'PGOT Portal <onboarding@resend.dev>';
-      
-      const { data, error } = await resend.emails.send({
+      const resend = new Resend(resendKey);
+      const fromAddress = (process.env.EMAIL_FROM || '').trim() || 'PGOT Portal <onboarding@resend.dev>';
+
+      const sendPromise = resend.emails.send({
         from: fromAddress,
         to: [PRIMARY_EMAIL, NOTIFICATION_EMAIL],
         replyTo: email,
@@ -157,6 +162,12 @@ Recipients: ${PRIMARY_EMAIL}, ${NOTIFICATION_EMAIL}
         html: htmlContent,
         text: textContent,
       });
+
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('Resend API request timed out after 5s')), 5000)
+      );
+
+      const { data, error } = await Promise.race([sendPromise, timeoutPromise]);
 
       if (error) {
         throw new Error(error.message || JSON.stringify(error));
@@ -169,25 +180,30 @@ Recipients: ${PRIMARY_EMAIL}, ${NOTIFICATION_EMAIL}
         recipients: [PRIMARY_EMAIL, NOTIFICATION_EMAIL],
       };
     } catch (err) {
-      console.error('Resend delivery failed, evaluating SMTP fallback:', err.message);
+      console.warn('[EMAIL NOTICE] Resend delivery attempt failed:', err.message);
     }
   }
 
   // 2. Try SMTP (Gmail App Password or custom SMTP) if configured
-  if (process.env.SMTP_USER && process.env.SMTP_PASS) {
+  const smtpUser = (process.env.SMTP_USER || '').trim();
+  const smtpPass = (process.env.SMTP_PASS || '').trim();
+  if (smtpUser && smtpPass) {
     try {
       const transporter = nodemailer.createTransport({
-        host: process.env.SMTP_HOST || 'smtp.gmail.com',
+        host: (process.env.SMTP_HOST || 'smtp.gmail.com').trim(),
         port: parseInt(process.env.SMTP_PORT || '465', 10),
         secure: process.env.SMTP_SECURE !== 'false',
         auth: {
-          user: process.env.SMTP_USER,
-          pass: process.env.SMTP_PASS,
+          user: smtpUser,
+          pass: smtpPass,
         },
+        connectionTimeout: 5000,
+        greetingTimeout: 5000,
+        socketTimeout: 5000,
       });
 
       const info = await transporter.sendMail({
-        from: `"${process.env.EMAIL_FROM_NAME || 'PGOT Customer Enquiry'}" <${process.env.SMTP_USER}>`,
+        from: `"${process.env.EMAIL_FROM_NAME || 'PGOT Customer Enquiry'}" <${smtpUser}>`,
         to: [PRIMARY_EMAIL, NOTIFICATION_EMAIL],
         replyTo: email,
         subject: emailSubject,
@@ -202,14 +218,18 @@ Recipients: ${PRIMARY_EMAIL}, ${NOTIFICATION_EMAIL}
         recipients: [PRIMARY_EMAIL, NOTIFICATION_EMAIL],
       };
     } catch (err) {
-      console.error('SMTP delivery failed:', err.message);
-      throw err;
+      console.warn('[EMAIL NOTICE] SMTP delivery attempt failed:', err.message);
     }
   }
 
-  // 3. Fallback Test Transport (Ethereal test account for development/testing verification)
+  // 3. Fallback Test Transport (Ethereal test account for development verification)
   try {
-    const testAccount = await nodemailer.createTestAccount();
+    const testAccountPromise = nodemailer.createTestAccount();
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('Ethereal test transport timed out')), 3000)
+    );
+
+    const testAccount = await Promise.race([testAccountPromise, timeoutPromise]);
     const testTransporter = nodemailer.createTransport({
       host: 'smtp.ethereal.email',
       port: 587,
@@ -218,6 +238,8 @@ Recipients: ${PRIMARY_EMAIL}, ${NOTIFICATION_EMAIL}
         user: testAccount.user,
         pass: testAccount.pass,
       },
+      connectionTimeout: 4000,
+      socketTimeout: 4000,
     });
 
     const info = await testTransporter.sendMail({
@@ -232,16 +254,16 @@ Recipients: ${PRIMARY_EMAIL}, ${NOTIFICATION_EMAIL}
     const previewUrl = nodemailer.getTestMessageUrl(info);
 
     return {
-      provider: 'Ethereal Test Transport (Configure RESEND_API_KEY or SMTP in .env for live inbox)',
+      provider: 'Ethereal Test Transport',
       success: true,
       messageId: info.messageId,
       previewUrl,
       recipients: [PRIMARY_EMAIL, NOTIFICATION_EMAIL],
     };
   } catch (fallbackErr) {
-    console.error('Fallback email transport error:', fallbackErr.message);
+    console.warn('[EMAIL NOTICE] Fallback transport unavailable:', fallbackErr.message);
     return {
-      provider: 'Local Storage Only',
+      provider: 'Database Storage (Email Deferred)',
       success: false,
       error: fallbackErr.message,
       recipients: [PRIMARY_EMAIL, NOTIFICATION_EMAIL],

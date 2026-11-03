@@ -30,7 +30,7 @@ function getSslConfig(connectionString) {
  */
 export function getPool() {
   if (!pool) {
-    const connectionString = process.env.DATABASE_URL;
+    const connectionString = (process.env.DATABASE_URL || '').trim();
     if (!connectionString) {
       console.warn('[DB WARNING] DATABASE_URL is not defined. PostgreSQL queries will not execute until DATABASE_URL is configured.');
       return null;
@@ -47,12 +47,12 @@ export function getPool() {
       });
 
       pool.on('error', (err) => {
-        console.error('[DB POOL ERROR] Unexpected idle PostgreSQL client error:', err.message);
+        console.error('[DB POOL ERROR] [OP: POOL_IDLE] Unexpected idle PostgreSQL client error:', err.message);
       });
 
       console.log(`[DB] PostgreSQL connection pool initialized (SSL: ${sslConfig ? 'enabled' : 'disabled'}).`);
     } catch (err) {
-      console.error('[DB ERROR] Failed to create PostgreSQL pool:', err.message);
+      console.error('[DB ERROR] [OP: POOL_INIT] Failed to create PostgreSQL pool:', err.message);
       throw err;
     }
   }
@@ -78,6 +78,7 @@ export function generateReferenceCode() {
 
 /**
  * Initialize the PostgreSQL schema and create table and indexes if they do not exist.
+ * Uses idempotent CREATE TABLE and ALTER TABLE statements to handle both fresh databases and pre-existing tables.
  */
 export async function initDb() {
   const p = getPool();
@@ -101,9 +102,23 @@ export async function initDb() {
         created_at TIMESTAMPTZ NOT NULL,
         email_status VARCHAR(50) DEFAULT 'PENDING',
         email_error TEXT,
-        ip_address VARCHAR(100)
+        ip_address TEXT
       );
 
+      ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS reference_code VARCHAR(100);
+      ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS full_name VARCHAR(255);
+      ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS company_name VARCHAR(255);
+      ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS email VARCHAR(255);
+      ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS phone VARCHAR(50);
+      ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS service VARCHAR(255);
+      ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS subject VARCHAR(255);
+      ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS message TEXT;
+      ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW();
+      ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS email_status VARCHAR(50) DEFAULT 'PENDING';
+      ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS email_error TEXT;
+      ALTER TABLE enquiries ADD COLUMN IF NOT EXISTS ip_address TEXT;
+
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_enquiries_reference_code ON enquiries(reference_code);
       CREATE INDEX IF NOT EXISTS idx_enquiries_email ON enquiries(email);
       CREATE INDEX IF NOT EXISTS idx_enquiries_created_at ON enquiries(created_at);
     `;
@@ -111,7 +126,7 @@ export async function initDb() {
     await client.query(schema);
     console.log('[DB] PostgreSQL schema verified and indexes initialized successfully.');
   } catch (err) {
-    console.error('[DB ERROR] Failed to initialize PostgreSQL schema:', err.message);
+    console.error(`[DB ERROR] [OP: DB_INIT] [CODE: ${err.code || 'ERR_SCHEMA_INIT'}] Failed to initialize PostgreSQL schema:`, err.message);
     throw err;
   } finally {
     client.release();
@@ -132,7 +147,7 @@ export async function ensureDbReady() {
 }
 
 /**
- * Save an inbound customer enquiry to PostgreSQL using transaction & parameterized query.
+ * Save an inbound customer enquiry to PostgreSQL using an atomic transaction & parameterized query.
  */
 export async function saveEnquiry({
   fullName,
@@ -153,9 +168,18 @@ export async function saveEnquiry({
   try {
     await ensureDbReady();
   } catch (initErr) {
-    console.warn('[DB WARNING] ensureDbReady warning, proceeding with insert attempt:', initErr.message);
+    console.warn('[DB WARNING] [OP: ENSURE_SCHEMA] Proceeding with insert attempt:', initErr.message);
   }
 
+  // Sanitize and bound field values to strictly adhere to PostgreSQL schema
+  const sanitizedFullName = String(fullName || '').trim().slice(0, 255);
+  const sanitizedCompanyName = String(companyName || '').trim().slice(0, 255);
+  const sanitizedEmail = String(email || '').trim().toLowerCase().slice(0, 255);
+  const sanitizedPhone = String(phone || '').trim().slice(0, 50);
+  const sanitizedService = String(service || 'General Technical Consultation').slice(0, 255);
+  const sanitizedSubject = String(subject || 'Customer Business Enquiry').slice(0, 255);
+  const sanitizedMessage = String(message || '').trim();
+  const sanitizedIp = String(ipAddress || 'Unknown').slice(0, 255);
   const createdAt = new Date().toISOString();
   const referenceCode = generateReferenceCode();
 
@@ -178,15 +202,15 @@ export async function saveEnquiry({
 
   const values = [
     referenceCode,
-    fullName,
-    companyName,
-    email,
-    phone,
-    service || 'General Technical Consultation',
-    subject || 'New Customer Enquiry',
-    message,
+    sanitizedFullName,
+    sanitizedCompanyName,
+    sanitizedEmail,
+    sanitizedPhone,
+    sanitizedService,
+    sanitizedSubject,
+    sanitizedMessage,
     createdAt,
-    ipAddress || 'Unknown',
+    sanitizedIp,
   ];
 
   const client = await p.connect();
@@ -195,7 +219,11 @@ export async function saveEnquiry({
     const result = await client.query(insertQuery, values);
     await client.query('COMMIT');
 
-    const row = result.rows[0];
+    const row = result.rows && result.rows[0];
+    if (!row) {
+      throw new Error('Database INSERT succeeded but returned no row.');
+    }
+
     return {
       id: row.id,
       referenceCode: row.reference_code,
@@ -204,10 +232,10 @@ export async function saveEnquiry({
   } catch (err) {
     try {
       await client.query('ROLLBACK');
-    } catch {
-      // Ignore rollback errors if connection was dropped
+    } catch (rollbackErr) {
+      console.warn('[DB WARNING] [OP: DB_ROLLBACK] Rollback error:', rollbackErr.message);
     }
-    console.error('[DB ERROR] Failed to save enquiry to PostgreSQL:', err.message);
+    console.error(`[DB ERROR] [OP: DB_INSERT] [CODE: ${err.code || 'ERR_DB_INSERT'}] ${err.message}`);
     throw err;
   } finally {
     client.release();
@@ -231,9 +259,9 @@ export async function updateEmailStatus(id, status, errorMsg = null) {
   `;
 
   try {
-    await p.query(query, [status, errorMsg, id]);
+    await p.query(query, [status, errorMsg ? String(errorMsg).slice(0, 1000) : null, id]);
   } catch (err) {
-    console.error(`[DB ERROR] Failed to update email status for enquiry ID ${id}:`, err.message);
+    console.error(`[DB ERROR] [OP: UPDATE_EMAIL_STATUS] [CODE: ${err.code || 'ERR_STATUS_UPDATE'}] Failed to update status for ID ${id}:`, err.message);
   }
 }
 
@@ -256,7 +284,7 @@ export async function getAllEnquiries(limit = 100) {
     const result = await p.query(query, [limit]);
     return result.rows;
   } catch (err) {
-    console.error('[DB ERROR] Failed to fetch enquiries from PostgreSQL:', err.message);
+    console.error(`[DB ERROR] [OP: GET_ALL_ENQUIRIES] [CODE: ${err.code || 'ERR_FETCH_ENQUIRIES'}]`, err.message);
     throw err;
   }
 }
@@ -275,7 +303,7 @@ export async function getEnquiryCount() {
     const result = await p.query(query);
     return parseInt(result.rows[0]?.count || 0, 10);
   } catch (err) {
-    console.error('[DB ERROR] Failed to get enquiry count from PostgreSQL:', err.message);
+    console.error(`[DB ERROR] [OP: GET_ENQUIRY_COUNT] [CODE: ${err.code || 'ERR_COUNT'}]`, err.message);
     throw err;
   }
 }

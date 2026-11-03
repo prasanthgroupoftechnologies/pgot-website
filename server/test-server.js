@@ -7,6 +7,7 @@ describe('PGOT Express Server & PostgreSQL API Endpoints', () => {
   let server;
   let baseUrl;
   const mockEnquiryDb = [];
+  let shouldFailDb = false;
 
   before(async () => {
     // Provide mock PostgreSQL pool for API testing
@@ -15,10 +16,15 @@ describe('PGOT Express Server & PostgreSQL API Endpoints', () => {
         if (query === 'BEGIN' || query === 'COMMIT' || query === 'ROLLBACK') {
           return { rows: [] };
         }
-        if (query.includes('CREATE TABLE')) {
+        if (query.includes('CREATE TABLE') || query.includes('ALTER TABLE')) {
           return { rows: [] };
         }
         if (query.includes('INSERT INTO enquiries')) {
+          if (shouldFailDb) {
+            const err = new Error('Simulated PostgreSQL connection failure');
+            err.code = '08006';
+            throw err;
+          }
           const id = mockEnquiryDb.length + 1;
           const row = {
             id,
@@ -133,6 +139,7 @@ describe('PGOT Express Server & PostgreSQL API Endpoints', () => {
     assert.ok(res.headers.get('content-type')?.includes('application/json'));
     const body = await res.json();
     assert.strictEqual(body.success, false);
+    assert.strictEqual(body.errorCode, 'ERR_MALFORMED_JSON');
     assert.ok(body.error.includes('Malformed JSON'));
   });
 
@@ -142,7 +149,7 @@ describe('PGOT Express Server & PostgreSQL API Endpoints', () => {
     assert.ok(res.headers.get('content-type')?.includes('application/json'));
     const body = await res.json();
     assert.strictEqual(body.success, false);
-    assert.ok(body.error.includes('Method Not Allowed'));
+    assert.strictEqual(body.errorCode, 'ERR_METHOD_NOT_ALLOWED');
   });
 
   it('GET /api/nonexistent-route should return 404 as JSON (not HTML)', async () => {
@@ -151,7 +158,7 @@ describe('PGOT Express Server & PostgreSQL API Endpoints', () => {
     assert.ok(res.headers.get('content-type')?.includes('application/json'));
     const body = await res.json();
     assert.strictEqual(body.success, false);
-    assert.ok(body.error.includes('Endpoint not found'));
+    assert.strictEqual(body.errorCode, 'ERR_NOT_FOUND');
   });
 
   it('POST /api/enquiry should reject submissions missing required fields with 400 JSON', async () => {
@@ -168,7 +175,7 @@ describe('PGOT Express Server & PostgreSQL API Endpoints', () => {
     });
     assert.strictEqual(res1.status, 400);
     const body1 = await res1.json();
-    assert.ok(body1.error.includes('Full Name'));
+    assert.strictEqual(body1.errorCode, 'ERR_VALIDATION_NAME');
 
     // Missing Company Name
     const res2 = await fetch(`${baseUrl}/api/enquiry`, {
@@ -184,7 +191,7 @@ describe('PGOT Express Server & PostgreSQL API Endpoints', () => {
     });
     assert.strictEqual(res2.status, 400);
     const body2 = await res2.json();
-    assert.ok(body2.error.includes('Company Name'));
+    assert.strictEqual(body2.errorCode, 'ERR_VALIDATION_COMPANY');
 
     // Invalid Email
     const res3 = await fetch(`${baseUrl}/api/enquiry`, {
@@ -199,6 +206,8 @@ describe('PGOT Express Server & PostgreSQL API Endpoints', () => {
       }),
     });
     assert.strictEqual(res3.status, 400);
+    const body3 = await res3.json();
+    assert.strictEqual(body3.errorCode, 'ERR_VALIDATION_EMAIL');
 
     // Invalid Phone (< 8 digits)
     const res4 = await fetch(`${baseUrl}/api/enquiry`, {
@@ -213,6 +222,8 @@ describe('PGOT Express Server & PostgreSQL API Endpoints', () => {
       }),
     });
     assert.strictEqual(res4.status, 400);
+    const body4 = await res4.json();
+    assert.strictEqual(body4.errorCode, 'ERR_VALIDATION_PHONE');
 
     // Short Message (< 10 chars)
     const res5 = await fetch(`${baseUrl}/api/enquiry`, {
@@ -227,6 +238,8 @@ describe('PGOT Express Server & PostgreSQL API Endpoints', () => {
       }),
     });
     assert.strictEqual(res5.status, 400);
+    const body5 = await res5.json();
+    assert.strictEqual(body5.errorCode, 'ERR_VALIDATION_MESSAGE');
   });
 
   it('POST /api/enquiry honeypot bot trap should silently discard bots with 200 JSON', async () => {
@@ -247,10 +260,13 @@ describe('PGOT Express Server & PostgreSQL API Endpoints', () => {
     assert.strictEqual(body.referenceCode, 'PGOT-ENQ-DISCARDED');
   });
 
-  it('POST /api/enquiry should save valid enquiry to PostgreSQL and return valid 200 JSON', async () => {
+  it('POST /api/enquiry should save valid enquiry to PostgreSQL and return 200 JSON even if email provider is offline', async () => {
     const res = await fetch(`${baseUrl}/api/enquiry`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Forwarded-For': '203.0.113.195, 70.41.3.18, 150.172.238.178, 108.162.245.105',
+      },
       body: JSON.stringify({
         fullName: 'Prasanth Founder',
         companyName: 'Prasanth Group of Technologies',
@@ -276,9 +292,37 @@ describe('PGOT Express Server & PostgreSQL API Endpoints', () => {
     assert.strictEqual(mockEnquiryDb[0].company_name, 'Prasanth Group of Technologies');
     assert.strictEqual(mockEnquiryDb[0].email, 'prasanth@pgot.in');
     assert.strictEqual(mockEnquiryDb[0].phone, '+916369727736');
+    assert.strictEqual(mockEnquiryDb[0].ip_address, '203.0.113.195');
   });
 
-  it('POST /api/enquiry/ with trailing slash should also succeed seamlessly', async () => {
+  it('POST /api/enquiry should return 500 JSON with errorCode if PostgreSQL insert fails', async () => {
+    shouldFailDb = true;
+
+    const res = await fetch(`${baseUrl}/api/enquiry`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fullName: 'Jane Doe',
+        companyName: 'Acme Corp',
+        email: 'jane@acme.com',
+        phone: '+15551234567',
+        service: 'Cloud Computing',
+        subject: 'Cloud Scale',
+        message: 'Testing database failure handling when PostgreSQL is unreachable.',
+      }),
+    });
+
+    assert.strictEqual(res.status, 500);
+    assert.ok(res.headers.get('content-type')?.includes('application/json'));
+    const body = await res.json();
+    assert.strictEqual(body.success, false);
+    assert.strictEqual(body.errorCode, '08006');
+    assert.ok(body.error.includes('database could not register'));
+
+    shouldFailDb = false;
+  });
+
+  it('POST /api/enquiry/ with trailing slash should succeed seamlessly', async () => {
     const res = await fetch(`${baseUrl}/api/enquiry/`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
